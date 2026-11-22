@@ -15,6 +15,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
@@ -787,7 +788,66 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
   '.woff2': 'font/woff2',
   '.woff': 'font/woff',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.wav': 'audio/wav',
+  '.txt': 'text/plain; charset=utf-8',
 };
+
+/* 压缩缓存：文本资源 gzip 一次，按 mtime 失效 */
+const gzCache = new Map();
+function gzBuffer(full, st) {
+  const key = full + '|' + st.mtimeMs + '|' + st.size;
+  let buf = gzCache.get(key);
+  if (!buf) {
+    try {
+      buf = zlib.gzipSync(fs.readFileSync(full), { level: 6 });
+    } catch {
+      return null;
+    }
+    if (gzCache.size > 60) gzCache.clear();
+    gzCache.set(key, buf);
+  }
+  return buf;
+}
+
+const TEXT_EXT = new Set(['.html', '.css', '.js', '.json', '.svg', '.txt']);
+
+/* 统一响应：按需 gzip + ETag，命中缓存返回 304 */
+function sendAsset(req, res, full, st, type, cacheControl) {
+  const etag = 'W/"' + st.size.toString(16) + '-' + Math.floor(st.mtimeMs).toString(16) + '"';
+  const headers = {
+    'content-type': type,
+    'cache-control': cacheControl,
+    'last-modified': st.mtime.toUTCString(),
+    etag,
+    vary: 'accept-encoding',
+  };
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  const ext = path.extname(full).toLowerCase();
+  const canGz = TEXT_EXT.has(ext) && st.size > 1024 && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  if (canGz) {
+    const buf = gzBuffer(full, st);
+    if (buf) {
+      headers['content-encoding'] = 'gzip';
+      headers['content-length'] = buf.length;
+      res.writeHead(200, headers);
+      res.end(req.method === 'HEAD' ? undefined : buf);
+      return;
+    }
+  }
+  headers['content-length'] = st.size;
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  fs.createReadStream(full).pipe(res);
+}
 
 function serveStatic(req, res, pathname) {
   let rel;
@@ -813,18 +873,9 @@ function serveStatic(req, res, pathname) {
   }
   if (!st.isFile()) return false;
 
-  const noCache = ext === '.json';
-  res.writeHead(200, {
-    'content-type': type,
-    'content-length': st.size,
-    'cache-control': noCache ? 'no-cache' : 'public, max-age=86400',
-    'last-modified': st.mtime.toUTCString(),
-  });
-  if (req.method === 'HEAD') {
-    res.end();
-    return true;
-  }
-  fs.createReadStream(full).pipe(res);
+  // 小文件（图标、音频）缓存一天；图片同理；文本资源日更也无妨
+  const cc = ext === '.json' ? 'no-cache' : 'public, max-age=86400';
+  sendAsset(req, res, full, st, type, cc);
   return true;
 }
 
@@ -862,12 +913,24 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/' || url.pathname === '/index.html') {
     try {
-      const html = fs.readFileSync(INDEX);
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
-      res.end(html);
+      const st = fs.statSync(INDEX);
+      sendAsset(req, res, INDEX, st, 'text/html; charset=utf-8', 'no-cache');
     } catch (e) {
       res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('index.html 读取失败: ' + e.message);
+    }
+    return;
+  }
+
+  // 图标别名：部分浏览器/系统会直接找这两个路径
+  if (url.pathname === '/apple-touch-icon-precomposed.png') {
+    const p2 = path.join(PUBLIC_DIR, 'apple-touch-icon.png');
+    try {
+      const st2 = fs.statSync(p2);
+      sendAsset(req, res, p2, st2, 'image/png', 'public, max-age=86400');
+    } catch {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Not Found');
     }
     return;
   }
