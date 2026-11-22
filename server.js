@@ -794,6 +794,9 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+/* 首页常驻内存：平台健康探测约每 5 秒请求一次，避免反复读 183KB 磁盘 */
+let idxCache = { mtimeMs: 0, buf: null };
+
 /* 压缩缓存：文本资源 gzip 一次，按 mtime 失效 */
 const gzCache = new Map();
 function gzBuffer(full, st) {
@@ -829,6 +832,30 @@ function sendAsset(req, res, full, st, type, cacheControl) {
     return;
   }
   const ext = path.extname(full).toLowerCase();
+  if (full === INDEX) {
+    if (idxCache.mtimeMs !== st.mtimeMs) {
+      try {
+        idxCache = { mtimeMs: st.mtimeMs, buf: fs.readFileSync(full) };
+      } catch {
+        return;
+      }
+    }
+    const canGz0 = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+    if (canGz0) {
+      const buf = gzBuffer(full, st);
+      if (buf) {
+        headers['content-encoding'] = 'gzip';
+        headers['content-length'] = buf.length;
+        res.writeHead(200, headers);
+        res.end(req.method === 'HEAD' ? undefined : buf);
+        return;
+      }
+    }
+    headers['content-length'] = idxCache.buf.length;
+    res.writeHead(200, headers);
+    res.end(req.method === 'HEAD' ? undefined : idxCache.buf);
+    return;
+  }
   const canGz = TEXT_EXT.has(ext) && st.size > 1024 && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
   if (canGz) {
     const buf = gzBuffer(full, st);
