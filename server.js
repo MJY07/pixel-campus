@@ -34,6 +34,7 @@ const ZONES = {
 const MAX_STUDENT_HP = 100;
 const MAX_BOSS_HP = 1000;
 const REVIVE_MS = 5000;
+const SLEEP_HEAL_PER_SEC = 6;   // 睡觉每秒回血（100 血约 17 秒睡满）
 
 const DMG_TAP = 20;
 const DMG_CHARGE = 50;
@@ -71,6 +72,18 @@ const rid = () => 'p' + now().toString(36) + crypto.randomBytes(3).toString('hex
 /* ============================== 排行榜持久化 ============================== */
 
 let scores = new Map();          // name -> score
+
+/* 管理员暗号（与前端 ADMIN_INPUTS 完全一致）：
+   输入 userMJY → 显示 MJY 并具备管理员权限；输入 userYNY → YNY。
+   单写 MJY / YNY 只是普通昵称，不给权限。 */
+const ADMIN_INPUTS = { usermjy: 'MJY', useryny: 'YNY' };
+function normName(raw) {
+  const base = cleanText(raw, MAX_NAME) || '同学';
+  const hit = ADMIN_INPUTS[base.toLowerCase()];
+  if (hit) return { name: hit, admin: true };
+  return { name: base, admin: false };
+}
+
 let admins = new Set(
   String(process.env.ADMIN_NAMES || '')
     .split(',').map((s) => s.trim()).filter(Boolean)
@@ -232,6 +245,10 @@ function pushScores(p) {
 /** 对某个玩家造成伤害；返回是否被击倒 */
 function damage(target, dmg, by, opts = {}) {
   if (!target || target.dead || !target.joined) return false;
+  // 兜底：目标关闭攻击系统则完全免疫（findTargets 已过滤，这里防新增路径漏判）
+  if (!target.pvp) return false;
+  // 兜底：攻击方关闭攻击系统则打不出伤害
+  if (by && by.id !== target.id && !by.pvp) return false;
 
   /* Boss：血量单独存 bossHp，不能写进 hp，否则会把老师自己的学生血条顶成 1000 */
   if (target.role === 'teacher') {
@@ -304,7 +321,7 @@ function onDown(target, by) {
     });
     // 本人：切回学生 UI
     send(target, { t: 'teacherEnd', msg: '你被击败了，已变回学生' });
-    send(target, { t: 'you', name: target.name, score: scores.get(target.name) || 0, admin: admins.has(target.name) });
+    send(target, { t: 'you', name: target.name, score: scores.get(target.name) || 0, admin: !!target.admin });
     // 其他人：把他当作普通玩家重新加入
     broadcastZone(target.zone, { t: 'join', p: publicOf(target) }, target.id);
     // 广播新的 Boss 列表（此时已无他）
@@ -434,6 +451,11 @@ function attack(p, msg) {
 function castSkill(p, k) {
   if (p.role !== 'teacher' || p.dead) return;
   if (!SKILL_CD[k]) return;
+  // 关闭攻击系统后，Boss 的技能也不能生效
+  if (!p.pvp) {
+    send(p, { t: 'bmsg', ok: 0, msg: '攻击系统已关闭，先开启才能使用技能' });
+    return;
+  }
   const t0 = now();
   p.skillCd = p.skillCd || {};
   if (t0 < (p.skillCd[k] || 0)) {
@@ -531,7 +553,8 @@ function joinZone(p, zoneKey) {
 /* ============================== 连接处理 ============================== */
 
 function handleJoin(ws, m) {
-  const name = cleanText(m.name, MAX_NAME) || '同学';
+  const nm = normName(m.name);
+  const name = nm.name;
   const cid = cleanText(m.cid, 40);
 
   // 同一浏览器重连：踢掉旧连接，避免一个显示成两个
@@ -554,7 +577,7 @@ function handleJoin(ws, m) {
     joined: true,
     name,
     role,
-    admin: admins.has(name),
+    admin: nm.admin || admins.has(name),
     zone,
     x: num(m.x, ZONES[zone].spawn.x, 0, ZONES[zone].w),
     y: num(m.y, ZONES[zone].spawn.y, 0, ZONES[zone].h),
@@ -720,11 +743,17 @@ function handleMessage(ws, raw) {
     }
 
     case 'rename': {
-      const name = cleanText(m.name, MAX_NAME);
-      if (!name) return;
-      p.name = name;
-      p.admin = admins.has(name);
-      send(p, { t: 'you', name, score: scores.get(name) || 0, admin: p.admin });
+      const nm = normName(m.name);
+      if (!nm.name) return;
+      const oldName = p.name;
+      p.name = nm.name;
+      p.admin = nm.admin || admins.has(nm.name);
+      if (oldName !== p.name) {
+        // 名牌、聊天里的名字都要换掉
+        broadcastZone(p.zone, { t: 'leave', id: p.id, name: oldName });
+        broadcastZone(p.zone, { t: 'join', p: publicOf(p) }, p.id);
+      }
+      send(p, { t: 'you', name: p.name, score: scores.get(p.name) || 0, admin: p.admin });
       broadcastZone(p.zone, { t: 'bs', list: bossesIn(p.zone) });
       break;
     }
@@ -1004,6 +1033,28 @@ setInterval(() => {
 }, 30000);
 
 setInterval(announceOnline, 15000);
+
+/* 睡觉回血：每秒结算一次，同区所有人都能看到 +N 飘字 */
+setInterval(() => {
+  for (const p of players.values()) {
+    if (!p.joined || p.dead || !p.sleep) continue;
+    const max = p.role === 'teacher' ? MAX_BOSS_HP : MAX_STUDENT_HP;
+    const cur = p.role === 'teacher' ? p.bossHp : p.hp;
+    if (cur >= max) continue;
+    const next = Math.min(max, cur + SLEEP_HEAL_PER_SEC);
+    const amount = next - cur;
+    if (amount <= 0) continue;
+    if (p.role === 'teacher') p.bossHp = next; else p.hp = next;
+    broadcastZone(p.zone, {
+      t: 'heal',
+      id: p.id,
+      hp: next,
+      x: Math.round(p.x),
+      y: Math.round(p.y),
+      amount,
+    });
+  }
+}, 1000);
 
 /* ============================== 启动 ============================== */
 
