@@ -2540,7 +2540,7 @@ function scheduleReconnect(){
 function sendMove(warp){
  if(!connected||!ws||ws.readyState!==1)return;
  const now=performance.now();
- if(!warp&&now-lastSend<85)return;
+ if(!warp&&now-lastSend<50)return;
  lastSend=now;
  try{ws.send(JSON.stringify({t:'m',x:rr(me.x),y:rr(me.y),dir:me.dir,
   anim:me.anim,run:me.run,bike:me.bike,sit:me.sit,jump:rr(me.jump),

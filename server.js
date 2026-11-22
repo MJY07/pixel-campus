@@ -49,7 +49,7 @@ const SKILL_DMG = { smash: 40, bolt: 26, burst: 20, quake: 34 };
 const DIR_VEC = [[0, 1], [-1, 0], [1, 0], [0, -1]];
 const MAX_NAME = 12;
 const MAX_CHAT = 120;
-const MOVE_GAP = 45;
+const MOVE_GAP = 28;
 const CD_SCALE = Number(process.env.CD_SCALE || 1);   // 压测用，生产保持 1
 
 const DATA_DIR = path.join(__dirname, 'data');
