@@ -29,6 +29,24 @@ export default {
       return getWorld(env).fetch(request);
     }
 
+    // 自检：确认静态资源在边缘确实可取（排查部署是否完整）
+    if (url.pathname === '/api/selftest') {
+      const files = ['/index.html', '/map/stardew.webp', '/audio/bell.mp3', '/map/t0_0.jpg', '/apple-touch-icon.png'];
+      const out = {};
+      for (const f of files) {
+        try {
+          const r = await env.ASSETS.fetch(new Request(new URL(f, url).toString(), request));
+          out[f] = { status: r.status, type: r.headers.get('content-type'), len: Number(r.headers.get('content-length') || 0) };
+          if (r.body) await r.body.cancel();
+        } catch (e) {
+          out[f] = { error: String(e && e.message) };
+        }
+      }
+      return new Response(JSON.stringify(out), {
+        headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+      });
+    }
+
     // 图标别名：部分浏览器/系统会直接找这个路径
     if (url.pathname === '/apple-touch-icon-precomposed.png') {
       const target = new URL('/apple-touch-icon.png', url);
