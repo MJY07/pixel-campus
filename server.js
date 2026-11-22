@@ -29,6 +29,8 @@ const ZONES = {
   lobby: { w: 1024, h: 1000, spawn: { x: 512, y: 520 }, name: '大厅' },
   exp: { w: 2304, h: 1898, spawn: { x: 120, y: 1338 }, name: 'A 区（卫星版）' },
   gen: { w: 2304, h: 1216, spawn: { x: 120, y: 760 }, name: 'B 区（像素版）' },
+  // 星露谷风：用同一张卫星图的像素重绘版做底图，碰撞沿用 A 区（卫星版）
+  stardew: { w: 2304, h: 1898, spawn: { x: 120, y: 1338 }, name: '星露谷风' },
 };
 
 const MAX_STUDENT_HP = 100;

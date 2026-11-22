@@ -297,12 +297,14 @@ html,body{margin:0;height:100%;height:100dvh;overflow:hidden;background:#0a0d12;
 #doorBar{position:absolute;left:50%;top:calc(212px + env(safe-area-inset-top));
   transform:translateX(-50%);z-index:31;display:none;gap:8px;white-space:nowrap}
 #doorBar.show{display:flex}
-#doorBar button{border-radius:12px;padding:9px 16px;font-size:12.5px;font-weight:800;
+#doorBar button{border-radius:12px;padding:9px 13px;font-size:12px;font-weight:800;
   color:#10151d;border:1px solid rgba(255,255,255,.35);cursor:pointer;
   box-shadow:0 5px 16px rgba(0,0,0,.42);font-family:inherit}
 #doorBar button:active{transform:scale(.95)}
 #doorExpBtn{background:linear-gradient(180deg,#ffe39a,#e8b94f)}
+#doorSdvBtn{background:linear-gradient(180deg,#c6ef9a,#7fc45a)}
 #doorGenBtn{background:linear-gradient(180deg,#a9e0ff,#61b7ee)}
+@media (max-width:520px){#doorBar{gap:5px}#doorBar button{padding:8px 9px;font-size:10.5px}}
 @media (max-height:620px){#doorBar{top:auto;bottom:calc(118px + env(safe-area-inset-bottom));gap:6px}
   #doorBar button{padding:7px 12px;font-size:11px}}
 
@@ -579,6 +581,7 @@ body.is-teacher #tHp{display:block}
 <div id="sleepBtn">😴 睡觉</div>
 <div id="doorBar">
   <button id="doorExpBtn" type="button">进入 A 区（卫星版）</button>
+  <button id="doorSdvBtn" type="button">进入 星露谷风</button>
   <button id="doorGenBtn" type="button">进入 B 区（像素版）</button>
 </div>
 
@@ -625,7 +628,7 @@ body.is-teacher #tHp{display:block}
 
 <div id="mapPanel">
   <header><h2>河北郑口中学 · 校园平面示意图
-    <small>A 区为高清卫星影像底图（原比例）· B 区为像素风底图 · 两区均从西门进校</small></h2>
+    <small>A 区为高清卫星影像底图（原比例）· 星露谷风为像素风重绘 · B 区为像素风底图 · 各分区均从西门/南门返回大厅</small></h2>
     <button class="btn" data-a="map">关闭</button></header>
   <div id="mapBody"><div id="planWrap"><canvas id="plan" width="832" height="439"></canvas></div><div id="legend"></div></div>
 </div>
@@ -682,23 +685,25 @@ try{
 const T=16,MW=144,MH=76;
 /* 每分区世界尺寸：A 区（卫星版）按卫星照片原比例 1202:990 → 2304×1898；
    B 区（像素版）沿用原像素地图 2304×1216。进区时切换。 */
-const ZW={exp:2304,gen:2304},ZH={exp:1898,gen:1216};
+const ZW={exp:2304,gen:2304,stardew:2304},ZH={exp:1898,gen:1216,stardew:1898};
 let WW=ZW.gen,WH=ZH.gen;
 
 /* ============ 大厅与班级分区 ============ */
-const ROOMS={lobby:'大厅',exp:'A 区（卫星版）',gen:'B 区（像素版）'};
+const ROOMS={lobby:'大厅',exp:'A 区（卫星版）',gen:'B 区（像素版）',stardew:'星露谷风'};
 const LOBBY_W=1024,LOBBY_H=1000;
 const LOBBY_SPAWN={x:512,y:520};
-/* 北墙 2 扇门：A 区（卫星版）/ B 区（像素版），左右各一扇，手机竖屏也醒目 */
+/* 北墙 3 扇门：A 区（卫星版）/ 星露谷风 / B 区（像素版） */
 const LOBBY_GATES=[
- {z:'exp',x:400,n:'A 区（卫星版）',c:'#ffd166'},
- {z:'gen',x:624,n:'B 区（像素版）',c:'#7cc7ff'}
+ {z:'exp',x:320,n:'A 区（卫星版）',c:'#ffd166'},
+ {z:'stardew',x:512,n:'星露谷风',c:'#8fd06a'},
+ {z:'gen',x:704,n:'B 区（像素版）',c:'#7cc7ff'}
 ];
 /* 分区内的传送门：站在光圈里回到大厅。
    A 区（卫星版）按标注图有两个门：西门 + 南门（蓝十字位置）；
-   B 区（像素版）沿用像素地图的西门。 */
+   星露谷风沿用同一张图的布局，传送门位置一致；B 区（像素版）沿用像素地图的西门。 */
 const CAMPUS_PORTALS={
  exp:[{x:39,y:1338.3,n:'西 门'},{x:2014.3,y:1862.7,n:'南 门'}],
+ stardew:[{x:39,y:1338.3,n:'西 门'},{x:2014.3,y:1862.7,n:'南 门'}],
  gen:[{x:3.1*T,y:38*T,n:'西 门'}]
 };
 /* 全景图上的区域标注（世界像素坐标，按卫星照片位置放） */
@@ -962,17 +967,32 @@ function terrainOf(zone){
   c.width=Math.round(WW*TS);c.height=Math.round(WH*TS);
   const g=c.getContext('2d');g.scale(TS,TS);
   terrain=c;tg=g;
-  if(zone==='exp')buildTerrainExp();else buildTerrainPix();
+  if(zone==='exp')buildTerrainExp();
+  else if(zone==='stardew')buildTerrainSdv();
+  else buildTerrainPix();
   TERRAIN_CACHE[zone]=c;
   WW=ow;WH=oh;
   miniBase=null;planBase=null;      // 缩略图/全景图缓存作废
   return c;
 }
+/* 星露谷风：整张像素重绘版底图铺满世界；碰撞与 A 区（卫星版）完全一致，不画红框 */
+function buildTerrainSdv(){
+  tg.fillStyle='#40503a'; tg.fillRect(0,0,WW,WH);
+  const im=new Image();
+  im.decoding='async';
+  im.onload=()=>{
+    tg.imageSmoothingEnabled=false;      // 像素画放大用最近邻，避免二次模糊
+    tg.drawImage(im,0,0,WW,WH);
+    miniBase=null;planBase=null;
+  };
+  im.src='/map/stardew.webp';
+}
 /* 进区时切换世界尺寸 / 碰撞体 / 底图：
-   A 区（卫星版）2304×1898 + 红框障碍，B 区（像素版）2304×1216 + 像素障碍 */
+   A 区（卫星版）2304×1898 + 红框障碍，B 区（像素版）2304×1216 + 像素障碍，
+   星露谷风与 A 区同尺寸、同碰撞 */
 function applyZoneWorld(){
  WW=ZW[me.zone]||2304;WH=ZH[me.zone]||1216;
- SOLIDS=me.zone==='exp'?SOLIDS_EXP:SOLIDS_GEN;
+ SOLIDS=me.zone==='gen'?SOLIDS_GEN:SOLIDS_EXP;
  if(me.zone!=='lobby')terrainOf(me.zone);
 }
 
@@ -2253,7 +2273,7 @@ function updateOnline(){
 }
 function updateZoneUI(){
  const e=$('zoneTxt');if(e)e.textContent=ROOMS[me.zone]||'大厅';
- const c=$('capTxt');if(c)c.textContent=me.zone==='lobby'?'大厅平面':(me.zone==='exp'?'A 区（卫星版）· 全图':'B 区（像素版）· 全图');
+ const c=$('capTxt');if(c)c.textContent=me.zone==='lobby'?'大厅平面':(me.zone==='stardew'?'星露谷风 · 全图':(me.zone==='exp'?'A 区（卫星版）· 全图':'B 区（像素版）· 全图'));
  const d=$('doorBar');if(d)d.classList.toggle('show',me.zone==='lobby'&&!gateOpen);
 }
 function snapCam(){
@@ -2808,7 +2828,7 @@ function zoneName(){
  return '校园';
 }
 function nearestBuilding(){
- if(me.zone==='lobby')return null;
+ if(me.zone!=='gen')return null;   // B 区像素版才有逐栋楼坐标，其他分区不给"查看建筑"
  let best=null,bd=1e9;
  for(const b of BLD){const cx=(b.x1+b.x2)/2,cy=b.y2+10;
   const d=Math.hypot(me.x-cx,me.y-cy);if(d<bd){bd=d;best=b;}}
@@ -2817,8 +2837,8 @@ function nearestBuilding(){
 /* 靠近宿舍楼（含职工宿舍）时才能睡觉；凹形楼取最大一段屋顶 */
 function nearestDorm(){
  if(me.zone==='lobby')return null;
- /* A 区（卫星版）：宿舍楼按 B 区像素版布局对应命名，走近即可睡到楼顶 */
- if(me.zone==='exp'){
+ /* A 区（卫星版）/ 星露谷风：宿舍楼按同一套碰撞盒命名，走近即可睡到楼顶 */
+ if(me.zone==='exp'||me.zone==='stardew'){
   let best=null,bd=1e9;
   for(const s of SOLIDS_EXP){
    if(!s.n)continue;                            // 只有宿舍楼可睡
@@ -2876,7 +2896,7 @@ function checkPortals(dt){
   }
   /* 骑到两扇门中间的墙上：提示门在左右两侧 */
   if(me.y<=320&&doorHintT<=0){
-   toast('两扇门在左右两侧 · 左「A 区（卫星版）」右「B 区（像素版）」');doorHintT=5;
+   toast('三扇门：左「A 区（卫星版）」中「星露谷风」右「B 区（像素版）」');doorHintT=5;
   }
  }else{
   /* 分区传送门：站进光圈回大厅（A 区西门+南门，B 区西门） */
@@ -3323,9 +3343,9 @@ function drawMini(){
 function buildLegend(){
  const box=$('legend');box.innerHTML='';
  /* 图例/传送目标基于像素版楼体（B 区）；A 区卫星版没有逐栋楼数据，不提供图例传送 */
- if(me.zone==='exp'){
+ if(me.zone==='exp'||me.zone==='stardew'){
   const h=document.createElement('div');h.className='grp';
-  h.textContent='A 区（卫星版）· 按真实影像呈现';box.appendChild(h);
+  h.textContent=(me.zone==='stardew'?'星露谷风 · 像素风重绘':'A 区（卫星版）· 按真实影像呈现');box.appendChild(h);
   const d=document.createElement('div');d.className='it';
   d.textContent='全图可浏览 · 走到西门/南门光圈回大厅';
   box.appendChild(d);
@@ -3349,7 +3369,7 @@ let planBase=null;
 function drawPlan(){
  const c=$('plan'),g=c.getContext('2d');
  /* A 区卫星版世界更高（1898），区域标注的 y 按比例放大 */
- const ayf=me.zone==='exp'?ZH.exp/ZH.gen:1;
+ const ayf=(me.zone==='exp'||me.zone==='stardew')?ZH.exp/ZH.gen:1;
  if(!planBase){
   const t=document.createElement('canvas');t.width=c.width;t.height=c.height;
   const q=t.getContext('2d');q.imageSmoothingEnabled=true;q.imageSmoothingQuality='high';
@@ -3378,7 +3398,7 @@ function drawPlan(){
  g.fillStyle='rgba(255,255,255,.92)';g.font='bold 11px sans-serif';g.textAlign='left';
  g.fillText('河 北 郑 口 中 学',8,20);
  g.fillStyle='rgba(255,255,255,.6)';g.font='9px sans-serif';
- g.fillText(me.zone==='exp'?'卫星影像底图 · 保持原始比例 · 白色描边为体积障碍':'像素底图 · 点击图例可传送到大致位置',8,c.height-8);
+ g.fillText(me.zone==='stardew'?'像素风重绘底图 · 与卫星版同一布局与碰撞':(me.zone==='exp'?'卫星影像底图 · 保持原始比例 · 白色描边为体积障碍':'像素底图 · 点击图例可传送到大致位置'),8,c.height-8);
  buildLegend();
 }
 /* 全景图只做展示：楼体不再有独立碰撞盒，点击不再直接传送 */
@@ -3510,6 +3530,7 @@ function doorTap(z){
  },1000);
 }
 $('doorExpBtn').onclick=()=>doorTap('exp');
+$('doorSdvBtn').onclick=()=>doorTap('stardew');
 $('doorGenBtn').onclick=()=>doorTap('gen');
 
 /* ============ 七、2D 俯视渲染与主循环 ============ */
@@ -3536,7 +3557,7 @@ function lampGlowOf(){
 function drawLight(vL,vT,vR,vB){
  const L=lightPhase();if(L.a<=0)return;
  ctx.fillStyle='rgba('+L.c+','+L.a+')';ctx.fillRect(vL,vT,vR-vL,vB-vT);
- if(L.a>.34 && me.zone!=='exp'){   /* 路灯坐标是像素版的，A 区卫星影像不点灯 */
+ if(L.a>.34 && me.zone==='gen'){   /* 路灯坐标是像素版的，卫星图/星露谷风不点灯 */
   ctx.save();ctx.globalCompositeOperation='lighter';
   const glow=lampGlowOf();
   for(const l of LAMPS){
@@ -3572,8 +3593,8 @@ function renderLobby(){
   ctx.fillStyle='rgba(8,12,18,.8)';ctx.fillRect(g.x-62,452,124,24);
   ctx.strokeStyle=g.c;ctx.globalAlpha=.5;ctx.lineWidth=1;
   ctx.strokeRect(g.x-62.5,452.5,123,23);ctx.globalAlpha=1;
-  ctx.fillStyle=g.c;ctx.font='bold 13px -apple-system,"PingFang SC",sans-serif';
-  ctx.fillText(g.n+' · 自动传送',g.x,460);
+  ctx.fillStyle=g.c;ctx.font='bold 12px -apple-system,"PingFang SC",sans-serif';
+  ctx.fillText(g.n,g.x,460);
   ctx.fillStyle='rgba(255,255,255,.5)';ctx.font='bold 9px sans-serif';
   ctx.fillText('走过门口即进入',g.x,473);
  }
