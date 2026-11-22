@@ -770,7 +770,63 @@ function handleClose(ws) {
 
 /* ============================== HTTP ============================== */
 
-const INDEX = path.join(__dirname, 'public', 'index.html');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const INDEX = path.join(PUBLIC_DIR, 'index.html');
+
+/* 静态资源：只放行 public 目录下白名单扩展名，拒绝目录穿越 */
+const MIME = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+};
+
+function serveStatic(req, res, pathname) {
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return false;
+  }
+  if (rel.includes('\0')) return false;
+
+  const full = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) return false;
+
+  const ext = path.extname(full).toLowerCase();
+  const type = MIME[ext];
+  if (!type) return false;
+
+  let st;
+  try {
+    st = fs.statSync(full);
+  } catch {
+    return false;
+  }
+  if (!st.isFile()) return false;
+
+  const noCache = ext === '.json';
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': st.size,
+    'cache-control': noCache ? 'no-cache' : 'public, max-age=86400',
+    'last-modified': st.mtime.toUTCString(),
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return true;
+  }
+  fs.createReadStream(full).pipe(res);
+  return true;
+}
 
 function healthJson() {
   const list = rankList();
@@ -815,6 +871,8 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
+
+  if (serveStatic(req, res, url.pathname)) return;
 
   res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('Not Found');
