@@ -51,7 +51,8 @@ const SKILL_DMG = { smash: 40, bolt: 26, burst: 20, quake: 34 };
 const DIR_VEC = [[0, 1], [-1, 0], [1, 0], [0, -1]];
 const MAX_NAME = 12;
 const MAX_CHAT = 120;
-const MOVE_GAP = 28;
+const MOVE_GAP = 20;            // 单连接收包最小间隔（防刷包）
+const NET_TICK_MS = 50;         // 20Hz 固定快照节拍：所有玩家同一时刻采样、合并成一包
 const CD_SCALE = Number(process.env.CD_SCALE || 1);   // 压测用，生产保持 1
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -143,6 +144,7 @@ function bossOf(p) {
   return {
     id: p.id, owner: p.id, name: p.name, zone: p.zone,
     x: Math.round(p.x), y: Math.round(p.y), dir: p.dir,
+    st: Math.round(p.st || 0),
     hp: p.bossHp ?? 0, maxHp: MAX_BOSS_HP, phase: p.phase || 1,
     dead: !!p.dead, cast: p.cast || null,
     cdL: cdLeft(p),
@@ -223,6 +225,56 @@ function broadcastAll(obj, exceptId) {
     if (!p.joined || p.id === exceptId) continue;
     if (!p.ws || p.ws.readyState !== 1) continue;
     try { p.ws.send(s); } catch { /* ignore */ }
+  }
+}
+
+/* ---------- 20Hz 快照广播 ----------
+   之前是「谁动一下就给全区分发一条」，包到达时刻完全随机：
+   客户端每隔几十毫秒收到一条不同玩家的位置突变，只能靠"追赶"去贴，
+   于是形成 20Hz 的速度脉冲（一鼓一鼓）。
+   现在改成固定 50ms 一次：同一分区所有玩家在同一时刻采样、压成一个数组、
+   只序列化一次、一条包发出。客户端拿到的时间戳等间隔，才能做匀速插值。 */
+
+const ANIM_IDX = { idle: 0, run: 1, walk: 2 };
+
+/** 一条采样：[id,x,y,dir,anim,flags,jump,hp,t]
+ *  末尾 t 是这条坐标"产生"的时刻（服务器时钟），不是发包时刻。
+ *  这样客户端插值看到的是等间隔、匀速的真实轨迹，不会因为采样相位差产生拍频。 */
+function packSample(s) {
+  const f = (s.run ? 1 : 0) | (s.bike ? 2 : 0) | (s.sit ? 4 : 0) |
+            (s.wave ? 8 : 0) | (s.sleep ? 16 : 0) | (s.dead ? 32 : 0) |
+            (s.pvp ? 0 : 64);
+  return [
+    s.id,
+    Math.round(s.x * 10) / 10,
+    Math.round(s.y * 10) / 10,
+    s.dir | 0,
+    ANIM_IDX[s.anim] ?? 0,
+    f,
+    Math.round(s.jump || 0),
+    Math.round(s.hp ?? 0),
+    Math.round(s.t),
+  ];
+}
+
+function netTick() {
+  const t = now();
+  /** @type {Map<string, {a:any[], boss:boolean}>} */
+  const byZone = new Map();
+
+  for (const p of players.values()) {
+    if (!p.joined) continue;
+    let z = byZone.get(p.zone);
+    if (!z) { z = { a: [], boss: false }; byZone.set(p.zone, z); }
+    if (p.role === 'teacher') { z.boss = true; p.sq.length = 0; continue; }
+    for (const s of p.sq) z.a.push(packSample(s));
+    p.sq.length = 0;
+  }
+
+  for (const [zone, z] of byZone) {
+    if (z.a.length) broadcastZone(zone, { t: 'mm', s: t, a: z.a });
+    // 老师（Boss）仍走 bs：带技能冷却、施法状态
+    if (z.boss) broadcastZone(zone, { t: 'bs', list: bossesIn(zone) });
   }
 }
 
@@ -598,6 +650,7 @@ function handleJoin(ws, m) {
     atkCd: 0,
     lastMove: 0,
     lastChat: 0,
+    st: 0, lastSt: 0, clkOff: null, sq: [],   // 移动采样队列与时钟校准
     joinedAt: now(),
   };
 
@@ -608,6 +661,7 @@ function handleJoin(ws, m) {
   send(p, {
     t: 'welcome',
     id: p.id,
+    s: now(),              // 服务器时钟：客户端用它校准插值时间轴
     n: zoneCount(zone),
     all: onlineCount(),
     players: rosterIn(zone, p.id),
@@ -633,11 +687,13 @@ function handleJoin(ws, m) {
 
 function handleMove(p, m) {
   const t0 = now();
-  if (t0 - p.lastMove < MOVE_GAP) return;
+  const warp = !!m.warp;
+  /* warp=true 是客户端的状态变更包（停下、跳跃、坐下、睡觉…），一定要收，
+     否则停下那一刻的包被节流丢掉，别人会一直看到你在原地走。 */
+  if (!warp && t0 - p.lastMove < MOVE_GAP) return;
   p.lastMove = t0;
 
   const z = zoneOf(p);
-  const warp = !!m.warp;
   const nx = num(m.x, p.x, 0, z.w);
   const ny = num(m.y, p.y, 0, z.h);
   if (!warp && (Math.abs(nx - p.x) > 90 || Math.abs(ny - p.y) > 90)) return;
@@ -653,12 +709,30 @@ function handleMove(p, m) {
   p.jump = num(m.jump, 0, 0, 20);
   p.sleep = !!m.sleep;
 
-  if (p.role === 'teacher') {
-    // 老师只通过 bs 同步，其他人不会把他当普通玩家
-    broadcastZone(p.zone, { t: 'bs', list: bossesIn(p.zone) }, p.id);
+  /* 这条坐标的产生时刻（服务器时钟）。
+     客户端带上自己发送时的本地时间，服务端用「最小单程延迟」估计时钟差，
+     把网络抖动从时间轴上剔除 —— 否则同一 20Hz 的采样会和 20Hz 的广播节拍
+     产生拍频：某一帧重复上一条坐标（画面停一拍），下一帧又补两格（跳一下）。 */
+  const cts = num(m.ts, 0, 0, 1e15);
+  let st;
+  if (cts > 0) {
+    const off = t0 - cts;
+    if (p.clkOff == null || off > p.clkOff) p.clkOff = off;   // 最小延迟样本
+    else p.clkOff += (off - p.clkOff) * 0.002;                // 极慢跟随时钟漂移
+    st = cts + p.clkOff;
   } else {
-    broadcastZone(p.zone, { t: 'm', p: publicOf(p) }, p.id);
+    st = t0;
   }
+  if (!(st > p.lastSt)) st = p.lastSt + 1;   // 严格递增
+  p.lastSt = st;
+  p.st = st;
+
+  p.sq.push({
+    id: p.id, t: st, x: p.x, y: p.y, dir: p.dir, anim: p.anim,
+    run: p.run, bike: p.bike, sit: p.sit, wave: p.wave, sleep: p.sleep,
+    dead: p.dead, pvp: p.pvp, jump: p.jump, hp: p.hp,
+  });
+  if (p.sq.length > 4) p.sq.splice(0, p.sq.length - 4);   // 突发补包时只保留最近几条
 }
 
 function handleMessage(ws, raw) {
@@ -1033,6 +1107,17 @@ setInterval(() => {
 }, 30000);
 
 setInterval(announceOnline, 15000);
+
+/* 快照节拍：用自校正定时器，把 tick 钉在固定网格上，避免 setInterval 累计漂移 */
+let _tickNext = Date.now() + NET_TICK_MS;
+function _tickLoop() {
+  try { netTick(); } catch (e) { console.error('[tick]', e.message); }
+  _tickNext += NET_TICK_MS;
+  const d = _tickNext - Date.now();
+  if (d < -NET_TICK_MS) _tickNext = Date.now() + NET_TICK_MS;   // 被长时间阻塞后重新对齐
+  setTimeout(_tickLoop, Math.max(1, d));
+}
+_tickLoop();
 
 /* 睡觉回血：每秒结算一次，同区所有人都能看到 +N 飘字 */
 setInterval(() => {

@@ -2233,6 +2233,12 @@ const ARROWS=[];             // 弓箭飞行轨迹
 const BOLTS=[];              // Boss 远程弹丸（暗影弹 / 弹幕）
 let chargeStart=0,pressAt=0,chargeTimer=null,jKeyDown=false;
 let online=1,onlineAll=1,myId='',ws=null,connected=false,retry=0,lastSend=0;
+/* ---- 网络插值状态：快照缓冲 + 播放时钟（见文件下方 interpOthers） ---- */
+let srvOff=null;          // 服务器时间 - 本地 performance.now()
+let playT=null;           // 播放时钟（服务器时间轴，匀速前进）
+let interpDelay=110;      // 当前渲染延迟 ms（平滑跟随 target）
+let interpDelayTarget=110;// 渲染延迟目标：覆盖 2 个 20Hz 快照 + 网络抖动
+let interpBad=0;          // 连续稳定帧计数（用于把延迟慢慢收回来）
 let cam={x:0,y:0},zoom=3,dpr=1,vw=0,vh=0;
 let pano=false,photoMode=false,mapOpen=false,cardOpen=false,gameMin=8*60;
 let keys={},joy={x:0,y:0,active:false},runHold=false;
@@ -2257,8 +2263,16 @@ function snapCam(){
 }
 function upsert(p){
  let o=others.get(p.id);
- if(!o){others.set(p.id,{...p,tx:p.x,ty:p.y,rx:p.x,ry:p.y,animPhase:0,chat:'',chatT:0});}
- else{o.tx=p.x;o.ty=p.y;Object.assign(o,p);}
+ if(!o){
+  o={...p,tx:p.x,ty:p.y,rx:p.x,ry:p.y,animPhase:0,chat:'',chatT:0,buf:[],bi:0};
+  others.set(p.id,o);
+  pushSnap(o,serverNow()-interpDelay*0.5,p.x,p.y);
+ }else{
+  o.tx=p.x;o.ty=p.y;
+  Object.assign(o,p);
+  /* 名单里的坐标只是参考值：已经有快照流的人不要被它打断 */
+  if(!o.buf||!o.buf.length)pushSnap(o,serverNow()-interpDelay*0.5,p.x,p.y);
+ }
 }
 function syncPlayers(list){
  const ids=new Set(list.filter(p=>p.id!==myId).map(p=>p.id));
@@ -2289,35 +2303,107 @@ function askWho(id){
  whoAsked.set(id,t);
  if(connected&&ws&&ws.readyState===1){try{ws.send(JSON.stringify({t:'who',id}));}catch(e){}}
 }
-/* 移动帧：已知的人只更新变化字段，未知的人先占位再补一次外观。
-   短帧 [id,x,y] 只代表位置变化，姿态沿用上一帧。 */
-function applyMove(v){
+/* ================= 网络插值：快照缓冲 + 固定延迟 =================
+   旧做法是"追赶"：每收到一个 20Hz 坐标就把目标点往前推，然后每帧按比例靠近。
+   目标点是阶梯状的，追赶必然产生"冲一下、慢下来"的速度脉冲 —— 这就是周期性卡顿。
+   新做法：每个玩家保留一小段按服务器时间排序的快照，播放时钟匀速前进，
+   在相邻两条快照之间做线性插值。位置是时间的连续函数，速度恒定，不会有脉冲。 */
+const SNAP_MAX=24;
+
+function noteServerTime(s){
+ if(typeof s!=='number'||!s)return;
+ const est=s-performance.now();            // 含单程延迟，所以 est <= 真实偏移
+ if(srvOff===null){srvOff=est;return;}
+ if(est>srvOff)srvOff=est;                 // 取延迟最小的样本当基准；不再向下漂移
+}
+function serverNow(){return srvOff===null?performance.now():performance.now()+srvOff;}
+
+function pushSnap(o,ts,x,y,meta){
+ if(!o.buf)o.buf=[];
+ const b=o.buf,last=b.length?b[b.length-1]:null;
+ let t=ts;
+ if(last&&t<=last.t)t=last.t+0.5;          // 时间必须严格递增（同一 tick 的两包）
+ /* 传送/切区：位移远超正常速度，直接重建缓冲，避免长距离滑行 */
+ if(last&&Math.hypot(x-last.x,y-last.y)>280){b.length=0;t=ts;o.bi=0;}
+ /* 长时间静止后再起步：旧帧太老，若拿它当插值基准会被拉成长段（先慢后快），
+    直接丢掉旧基准，从这一帧重新开始 */
+ if(last&&t-last.t>300){b.length=0;o.bi=0;}
+ if(!b.length){o.rx=x;o.ry=y;o.x=x;o.y=y;}
+ b.push({t,x,y});
+ o.tx=x;o.ty=y;o.x=x;o.y=y;o.arrAt=performance.now();
+ if(meta)Object.assign(o,meta);
+ if(b.length>SNAP_MAX)b.shift();
+}
+
+/* 移动帧：[id,x,y,dir,anim,flags,jump,hp]；短帧 [id,x,y(,dir)] 只带位置 */
+function applyMove(v,ts){
  let o=others.get(v[0]);
  if(!o){
   o={id:v[0],name:'同学',admin:false,color:'#4a90d9',skin:0,x:v[1],y:v[2],
-   tx:v[1],ty:v[2],rx:v[1],ry:v[2],animPhase:0,chat:'',chatT:0};
+   tx:v[1],ty:v[2],rx:v[1],ry:v[2],animPhase:0,chat:'',chatT:0,buf:[],bi:0};
   others.set(v[0],o);askWho(v[0]);
  }
- /* 用两次服务端坐标差估算速度：包到达不规律时靠它在空档里继续推进 */
- const _now=performance.now();
- if(o.tUpdate&&o.tx!=null){
-  const dtm=(_now-o.tUpdate)/1000;
-  if(dtm>0.015&&dtm<0.45){
-   const vx=(v[1]-o.tx)/dtm, vy=(v[2]-o.ty)/dtm;
-   if(Math.hypot(vx,vy)<2600){                 // 异常跳变不当成速度
-    o.vx=o.vx==null?vx:o.vx*.55+vx*.45;
-    o.vy=o.vy==null?vy:o.vy*.55+vy*.45;
-   }
-  }
+ const t=(v.length>8&&typeof v[8]==='number')?v[8]:(typeof ts==='number'?ts:serverNow());
+ if(v.length<=4){
+  pushSnap(o,t,v[1],v[2]);
+  if(v.length===4)o.dir=v[3];
+  return;
  }
- o.tUpdate=_now;
- o.tx=v[1];o.ty=v[2];o.x=v[1];o.y=v[2];
- if(v.length<=4){if(v.length===4)o.dir=v[3];return;}
  const p=unpackMove(v);
- o.dir=p.dir;o.anim=p.anim;
- o.run=p.run;o.bike=p.bike;o.sit=p.sit;o.wave=p.wave;o.sleep=p.sleep;
- o.dead=p.dead;o.pvp=p.pvp;o.jump=p.jump;o.hp=p.hp;
+ pushSnap(o,t,v[1],v[2],{
+  dir:p.dir,anim:p.anim,run:p.run,bike:p.bike,sit:p.sit,wave:p.wave,
+  sleep:p.sleep,dead:p.dead,pvp:p.pvp,jump:p.jump,hp:p.hp});
 }
+
+/* 每帧：计算播放时刻 + 对所有远端玩家做插值
+   关键：playT 直接由墙钟算出（performance.now），不做逐帧累加。
+   累加会被 dt 上限/掉帧截断，导致"落后→追帧"的周期性变速；
+   直接取墙钟则位置是时间的纯函数，帧率再抖也不影响运动速度。 */
+function interpOthers(dt){
+ if(srvOff===null){playT=null;return;}
+ /* 延迟目标平滑过渡：每次只挪 0.6ms，位置不会因为延迟调整而跳动 */
+ interpDelay+=clamp(interpDelayTarget-interpDelay,-0.6,0.6);
+ playT=performance.now()+srvOff-interpDelay;
+
+ let under=0,n=0;
+ for(const o of others.values()){
+  const b=o.buf;
+  if(!b||!b.length){o.rx=o.tx;o.ry=o.ty;o.x=o.rx;o.y=o.ry;continue;}
+  n++;
+  let i=o.bi|0;
+  if(i>=b.length)i=b.length-1;
+  while(i>0&&b[i].t>playT)i--;
+  while(i+1<b.length&&b[i+1].t<=playT)i++;
+  o.bi=i;
+  if(i>2){b.splice(0,i-1);i=1;o.bi=1;}   // 丢掉已经走过的帧（保留 1 帧做外推基准）
+  const a=b[i],c=b[i+1];
+  if(!c){
+   /* 还没收到下一帧：只用最后一段速度最多外推 80ms，之后钉住（不漂移、不过冲） */
+   let ex=0;
+   if(i>0){
+    const pv=b[i-1],span=a.t-pv.t;
+    if(span>4)ex=clamp((playT-a.t)/span,0,Math.min(1.8,80/span));
+   }
+   if(ex>0){o.rx=a.x+(a.x-b[i-1].x)*ex;o.ry=a.y+(a.y-b[i-1].y)*ex;}
+   else{o.rx=a.x;o.ry=a.y;}
+   if(playT>a.t+45&&playT<a.t+400&&performance.now()-(o.arrAt||0)<400)under++;
+   o.x=o.rx;o.y=o.ry;
+   continue;
+  }
+  if(playT<=a.t){o.rx=a.x;o.ry=a.y;o.x=a.x;o.y=a.y;continue;}
+  const span=c.t-a.t;
+  const f=span>0.5?clamp((playT-a.t)/span,0,1):1;
+  o.rx=a.x+(c.x-a.x)*f;
+  o.ry=a.y+(c.y-a.y)*f;
+  o.x=o.rx;o.y=o.ry;
+ }
+ /* 自适应：经常断流就多缓一点（上限 200ms），长期稳定再慢慢收回到 110ms */
+ if(n>=2){
+  if(under/n>0.35){interpDelayTarget=Math.min(200,interpDelayTarget+10);interpBad=0;}
+  else if(++interpBad>240&&interpDelayTarget>110){interpDelayTarget-=5;interpBad=0;}
+ }
+}
+
 function applyRoster(list,compact){
  (list||[]).forEach(a=>{
   const p=compact?unpackP(a):a;
@@ -2339,6 +2425,7 @@ function handleMsg(m){
  switch(m.t){
   case 'welcome':
    myId=m.id;online=m.n||1;if(m.all!=null)onlineAll=m.all;others.clear();
+   noteServerTime(m.s);playT=null;   // 重连后重新对齐播放时钟
    {const chatBox=$('chat');if(chatBox)chatBox.innerHTML='';}
    if(m.name)me.name=m.name;
    if(typeof m.admin==='boolean'){me.admin=m.admin;document.body.classList.toggle('is-admin',!!me.admin);}
@@ -2364,7 +2451,7 @@ function handleMsg(m){
    if(typeof m.y==='number')me.y=m.y;
    me.hp=m.hp??MAX_HP;me.dead=false;me.sleep=false;me._preSleep=null;me._sleepName='';
    me.hurtT=0;me.atkT=0;me.jump=0;me.sit=false;me.bike=false;me.run=false;me.anim='idle';
-   others.clear();applyRoster(m.players,!!m.compact);
+   others.clear();playT=null;applyRoster(m.players,!!m.compact);
    const chatBox=$('chat');if(chatBox)chatBox.innerHTML='';   // 切区清空，聊天记录也不串区
    online=m.n||1;if(m.all!=null)onlineAll=m.all;zoneCd=1.2;FX.length=0;
    bosses=[];syncBosses(m.bosses||[]);BFX.length=0;ARROWS.length=0;BOLTS.length=0;
@@ -2392,8 +2479,8 @@ function handleMsg(m){
   case 'alln':if(m.n!=null){onlineAll=m.n;updateOnline();}break;
   case 'leave':others.delete(m.id);updateOnline();break;
   case 'm':if(m.p&&m.p.id!==myId)upsert(m.p);break;
-  case 'mm':(m.a||[]).forEach(p=>{if(p.id!==myId)applyMove(p);});break;
-  case 'mmv':(m.a||[]).forEach(applyMove);break;
+  case 'mm':if(typeof m.s==='number')noteServerTime(m.s);(m.a||[]).forEach(v=>{if(v[0]!==myId)applyMove(v,m.s);});break;
+  case 'mmv':if(typeof m.s==='number')noteServerTime(m.s);(m.a||[]).forEach(v=>applyMove(v,m.s));break;
   /* 心跳回包：只含「谁还在本区」的 id，位置由移动帧维护 */
   case 'rsp':{
    online=m.n;if(m.all!=null)onlineAll=m.all;
@@ -2555,7 +2642,8 @@ function sendMove(warp){
  const now=performance.now();
  if(!warp&&now-lastSend<50)return;
  lastSend=now;
- try{ws.send(JSON.stringify({t:'m',x:rr(me.x),y:rr(me.y),dir:me.dir,
+ try{ws.send(JSON.stringify({t:'m',ts:now,
+  x:Math.round(me.x*100)/100,y:Math.round(me.y*100)/100,dir:me.dir,
   anim:me.anim,run:me.run,bike:me.bike,sit:me.sit,jump:rr(me.jump),
   wave:!!me.wave,warp:!!warp,sleep:!!me.sleep}));}catch(e){}
 }
@@ -2818,6 +2906,7 @@ function toggleSleep(){
  toast('躺到「'+d.b.n+'」楼顶睡一觉 · 持续回血');
 }
 
+let meMoving=false;
 function updatePlayer(dt){
  const canMove=!gateOpen&&!mapOpen&&!cardOpen&&!rankOpen&&!annOpen&&!noticeOpen&&!bossOpen&&!chatFocus&&!me.dead&&!me.sleep;
  let dx=0,dy=0;
@@ -2838,7 +2927,12 @@ function updatePlayer(dt){
   me.anim=running?'run':'walk';me.run=running;
   me.animPhase+=dt*(running?17:10);
   sendMove(false);
- }else{me.anim='idle';me.run=false;}
+  meMoving=true;
+ }else{
+  me.anim='idle';me.run=false;
+  /* 停下的那一帧立刻补发一条：否则别人会一直看到你在原地"走" */
+  if(meMoving){meMoving=false;sendMove(true);}
+ }
  if(me.jump>0){me.jump=Math.max(0,me.jump-dt*30);}
  if(me.waveT>0){me.waveT-=dt;if(me.waveT<=0){me.wave=0;sendMove(true);}}
  if(me.chatT>0)me.chatT-=dt;
@@ -2852,28 +2946,9 @@ function updatePlayer(dt){
   me.x=clamp(me.x,10,WW-10);me.y=clamp(me.y,10,WH-10);
  }
 
- // 其他玩家插值
- const _tnow=performance.now();
+ // 其他玩家：快照缓冲插值（匀速、无脉冲）
+ interpOthers(dt);
  for(const o of others.values()){
-  /* 外推：距最近一次更新越久，越依赖最后速度；超过 0.3s 线性衰减，停下时不冲过头 */
-  const age=clamp((_tnow-(o.tUpdate||0))/1000,0,0.5);
-  let gx=o.tx,gy=o.ty;
-  if(o.vx!=null&&age>0){
-   if(Math.hypot(o.vx,o.vy)<30){o.vx=0;o.vy=0;}   // 基本停下，不再外推
-   else{
-    /* 前 0.2s 全速推进，之后 0.4s 内线性收尾：长空档不会僵住，停手也不会冲过头 */
-    const damp=age<0.2?1:Math.max(0,1-(age-0.2)/0.4);
-    gx+=o.vx*age*damp;gy+=o.vy*age*damp;
-   }
-  }
-  const k=clamp(dt*18,0,1);
-  let dx=(gx-o.rx)*k, dy=(gy-o.ry)*k;
-  /* 追赶限速：正常速度约 2px/帧，追赶最多 8px/帧，避免长空档结束后猛跳一帧 */
-  const mag=Math.hypot(dx,dy);
-  if(mag>8){dx*=8/mag;dy*=8/mag;}
-  o.rx+=dx;o.ry+=dy;
-  /* 偏差过大说明是传送/切区，直接对齐，避免长距离飞行 */
-  if(Math.hypot(gx-o.rx,gy-o.ry)>240){o.rx=gx;o.ry=gy;}
   o.animPhase=(o.animPhase||0)+dt*((o.anim==='run')?17:10);
   if(o.chatT>0)o.chatT-=dt;
   if(o.atkT>0)o.atkT=Math.max(0,o.atkT-dt);
@@ -3023,14 +3098,24 @@ function syncBosses(list,part){
  const ids=new Set();
  for(const n of list){
   ids.add(n.id);
+  const ts=(n.st&&n.st>0)?n.st:serverNow();   // 有产生时刻就用它，去掉网络抖动
   let b=bosses.find(x=>x.id===n.id);
   if(!b){
    b={id:n.id,owner:n.owner||'',name:n.name,zone:n.zone,x:n.x,y:n.y,rx:n.x,ry:n.y,dir:n.dir||0,
       hp:n.hp,maxHp:n.maxHp,phase:n.phase||1,dead:!!n.dead,
-      cast:n.cast||null,hurtT:0,_lx:n.x,cdL:n.cdL||null};
+      cast:n.cast||null,hurtT:0,_lx:n.x,cdL:n.cdL||null,buf:[{t:ts,x:n.x,y:n.y}],bi:0};
    bosses.push(b);
   }else{
-   b.owner=n.owner||'';b.name=n.name;b.zone=n.zone;b.x=n.x;b.y=n.y;
+   b.owner=n.owner||'';b.name=n.name;b.zone=n.zone;
+   /* Boss 也走快照插值：位置进缓冲，渲染时按播放时钟取，和环境里其他人一样匀速 */
+   const prev=b.buf&&b.buf.length?b.buf[b.buf.length-1]:null;
+   if(prev&&ts<=prev.t){/* 同一条采样重复下发：不重复入缓冲，否则会出现 0.5ms 的空段 */}
+   else{
+    if(!prev||Math.hypot(n.x-prev.x,n.y-prev.y)>280||ts-prev.t>300){b.buf=[];b.bi=0;}
+    b.buf.push({t:ts,x:n.x,y:n.y});
+    if(b.buf.length>24)b.buf.shift();
+   }
+   b.x=n.x;b.y=n.y;
    b.hp=n.hp;b.maxHp=n.maxHp;b.phase=n.phase||1;
    b.dead=!!n.dead;if(b.dead&&!b.deadAt)b.deadAt=performance.now();
    b.cast=n.cast||null;
@@ -3039,14 +3124,27 @@ function syncBosses(list,part){
  }
  if(!part)bosses=bosses.filter(b=>ids.has(b.id));   // part=1 是老师私有冷却帧：只合并，不清别人
 }
-/* 位置插值：服务端 150ms 一帧，客户端每帧靠近一点，看起来才顺 */
+/* Boss 位置：和远端玩家同一套快照插值（原来"每帧靠近一点"同样会一鼓一鼓） */
 function smoothBosses(dt){
+ const pt=playT==null?serverNow():playT;
  for(const b of bosses){
-  if(b.owner&&b.owner===myId&&!me.dead){b.x=me.x;b.y=me.y;}   // 老师：自己的 Boss 零延迟跟随
-  if(b.rx==null){b.rx=b.x;b.ry=b.y;}
-  const k=clamp(dt*14,0,1);
-  b.rx=lerp(b.rx,b.x,k);
-  b.ry=lerp(b.ry,b.y,k);
+  if(b.owner&&b.owner===myId&&!me.dead){b.x=me.x;b.y=me.y;b.rx=me.x;b.ry=me.y;continue;}   // 老师：自己的 Boss 零延迟跟随
+  const buf=b.buf;
+  if(!buf||!buf.length){if(b.rx==null){b.rx=b.x;b.ry=b.y;}continue;}
+  let i=b.bi|0;
+  if(i>=buf.length)i=buf.length-1;
+  while(i>0&&buf[i].t>pt)i--;
+  while(i+1<buf.length&&buf[i+1].t<=pt)i++;
+  b.bi=i;
+  if(i>2){buf.splice(0,i-1);i=1;b.bi=1;}
+  const a=buf[i],c=buf[i+1];
+  if(!c||pt<=a.t){b.rx=a.x;b.ry=a.y;}
+  else{
+   const span=c.t-a.t;
+   const f=span>0.5?clamp((pt-a.t)/span,0,1):1;
+   b.rx=a.x+(c.x-a.x)*f;
+   b.ry=a.y+(c.y-a.y)*f;
+  }
   if(b.hurtT>0)b.hurtT=Math.max(0,b.hurtT-dt);
   /* 尸体 8 秒后由服务端移除，这里只需保留倒下动画 */
  }
@@ -3423,16 +3521,27 @@ function lightPhase(){
  if(h>=19.5||h<5)return {a:.56,c:'14,26,72'};
  return {a:.2,c:'255,175,115'};
 }
+/* 路灯光晕预烘焙成一张 108px 贴图：原来每帧为几十盏灯各建一次径向渐变，
+   夜间帧成本会翻几倍，正好也是"周期性一顿"的来源之一 */
+let lampGlow=null;
+function lampGlowOf(){
+ if(lampGlow)return lampGlow;
+ const c=document.createElement('canvas');c.width=c.height=108;
+ const g=c.getContext('2d');
+ const gr=g.createRadialGradient(54,54,2,54,54,54);
+ gr.addColorStop(0,'rgba(255,216,132,.45)');gr.addColorStop(1,'rgba(255,216,132,0)');
+ g.fillStyle=gr;g.fillRect(0,0,108,108);
+ lampGlow=c;return c;
+}
 function drawLight(vL,vT,vR,vB){
  const L=lightPhase();if(L.a<=0)return;
  ctx.fillStyle='rgba('+L.c+','+L.a+')';ctx.fillRect(vL,vT,vR-vL,vB-vT);
  if(L.a>.34 && me.zone!=='exp'){   /* 路灯坐标是像素版的，A 区卫星影像不点灯 */
   ctx.save();ctx.globalCompositeOperation='lighter';
+  const glow=lampGlowOf();
   for(const l of LAMPS){
    if(l.x<vL-70||l.x>vR+70||l.y<vT-70||l.y>vB+70)continue;
-   const g=ctx.createRadialGradient(l.x,l.y,2,l.x,l.y,54);
-   g.addColorStop(0,'rgba(255,216,132,.45)');g.addColorStop(1,'rgba(255,216,132,0)');
-   ctx.fillStyle=g;ctx.fillRect(l.x-54,l.y-54,108,108);
+   ctx.drawImage(glow,l.x-54,l.y-54);
   }
   ctx.restore();
  }
@@ -3452,7 +3561,7 @@ function renderLobby(){
   ctx.fillRect(g.x-38,140,76,26);ctx.globalAlpha=1;
  }
  const ents=[];
- for(const o of others.values())ents.push({y:o.ry,k:'p',o:{...o,x:o.rx,y:o.ry}});
+ for(const o of others.values())ents.push({y:o.ry,k:'p',o});
  ents.push({y:me.y,k:'p',o:me,self:true});
  ents.sort((a,b)=>a.y-b.y);
  TAG_RECTS.length=0;
@@ -3518,7 +3627,15 @@ function renderWorld(){
  const cx=rr(cam.x*zoom)/zoom,cy=rr(cam.y*zoom)/zoom;
  ctx.setTransform(s,0,0,s,-cx*s,-cy*s);
  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
- ctx.drawImage(terrainOf(me.zone),0,0,WW,WH);
+ /* 只贴视口覆盖到的那一块地形：整张 4000px 大图每帧整体重采样太贵，
+     会在高 DPI 屏上周期性掉帧；裁到可视区后基本是 1:1 采样。 */
+ {
+  const terr=terrainOf(me.zone);
+  const kx=terr.width/WW, ky=terr.height/WH;
+  const sx0=Math.max(0,Math.floor(cx)-1), sy0=Math.max(0,Math.floor(cy)-1);
+  const sw=Math.min(WW-sx0,Math.ceil(vw/zoom)+3), sh=Math.min(WH-sy0,Math.ceil(vh/zoom)+3);
+  if(sw>0&&sh>0)ctx.drawImage(terr,sx0*kx,sy0*ky,sw*kx,sh*ky,sx0,sy0,sw,sh);
+ }
  const vL=cx-30,vR=cx+vw/zoom+30,vT=cy-30,vB=cy+vh/zoom+30;
  const ents=[];
  /* B 区像素版：楼体和树是逐栋绘制的实体（带阴影立体感）；A 区卫星版影像里已有楼 */
@@ -3528,7 +3645,7 @@ function renderWorld(){
  }
  for(const pt of (CAMPUS_PORTALS[me.zone]||[]))ents.push({y:pt.y,k:'portal',o:pt});
  for(const o of others.values())if(o.rx>vL&&o.rx<vR&&o.ry>vT&&o.ry<vB)
-  ents.push({y:o.sleep?99999:o.ry,k:'p',o:{...o,x:o.rx,y:o.ry}});
+  ents.push({y:o.sleep?99999:o.ry,k:'p',o});
  for(const b of bosses){
   const bx=b.rx??b.x,by2=b.ry??b.y;
   if(bx>vL-60&&bx<vR+60&&by2>vT-160&&by2<vB+60)
@@ -3596,8 +3713,8 @@ function loop(ts){
  updatePlayer(dt);
  smoothBosses(dt);
  renderWorld();
- if((miniT-=dt)<=0){drawMini();miniT=.12;}
- if((hudT-=dt)<=0){updateHUD();hudT=.15;}
+ if((miniT-=dt)<=0){drawMini();miniT=.18;}
+ if((hudT-=dt)<=0){updateHUD();hudT=.2;}
  requestAnimationFrame(loop);
 }
 
