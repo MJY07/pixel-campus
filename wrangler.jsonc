@@ -1,0 +1,20 @@
+{
+  "name": "pixel-campus",
+  "main": "cf/worker.js",
+  "compatibility_date": "2025-11-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "GAME", "class_name": "Game" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Game"] }
+  ],
+  "observability": { "enabled": true },
+  "vars": {
+    "MAINTAIN": "0"
+  }
+}
