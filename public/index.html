@@ -855,13 +855,13 @@ const CAMPUS_OBST_EXP=[
 [1705.8,644.4,2287.8,715.3,'solid'],
 [2127.6,583.5,2216.8,670.7,'solid'],
 [1847.7,551.1,1981.6,670.8,'solid'],
-[1620.6,549.1,1730.2,725.6,'solid'],
+[1638.0,572.0,1732.0,722.0,'solid'],
 [841.9,616.2,1101.6,938.6,'solid'],
 [1204.9,616.1,1499.0,741.8,'solid'],
 [1188.7,837.2,1482.8,962.9,'solid'],
 [1805.2,843.2,1851.9,895.9,'solid'],
 [2077.0,1374.4,2300.1,1536.6,'solid'],
-[2233.1,1155.4,2304,1390.6,'solid'],
+[2262.0,1155.4,2304,1390.6,'solid'],
 [2077.0,1013.4,2300.1,1177.7,'solid'],
 [1188.8,1058.2,1482.8,1183.9,'solid'],
 [0.5,1107.1,83.6,1295.7,'solid'],
@@ -871,10 +871,10 @@ const CAMPUS_OBST_EXP=[
 [120.2,1407.2,1105.7,1542.9,'solid'],
 [1188.9,1500.3,1482.9,1597.6,'solid'],
 [700.2,1634.2,1081.4,1776.1,'solid'],
-[1195.0,1747.7,1497.2,1863.2,'solid'],
-[1195.0,1747.7,1245.7,1818.7,'solid'],
-[1186.9,1684.8,1245.7,1774.0,'solid'],
-[1438.3,1662.5,1495.1,1774.0,'solid'],
+[1192.0,1745.0,1462.0,1840.0,'solid'],
+[1192.0,1745.0,1240.0,1810.0,'solid'],
+[1186.9,1655.0,1240.0,1737.0,'solid'],
+[1408.0,1662.0,1460.0,1732.0,'solid'],
 [49.3,1827.0,258.1,1885.7,'solid'],
 [2064.9,1844.9,2292.1,1891.5,'solid']
 ];
@@ -886,6 +886,17 @@ const DORM_NAMES={
  35:'五号宿舍楼',37:'六号宿舍楼',38:'六号宿舍楼',39:'六号宿舍楼',40:'六号宿舍楼'
 };
 const SOLIDS_EXP=CAMPUS_OBST_EXP.map((r,i)=>({x1:r[0],y1:r[1],x2:r[2],y2:r[3],t:r[4],b:null,n:DORM_NAMES[i]||null}));
+
+/* 星露谷风：像素重绘底图与卫星影像的楼体边缘有几像素的绘制差，
+   这里给每个框单独留了微调口（[左,上,右,下] 的像素修正），
+   连同全局偏移一起作用，让白色碰撞描边正好压在像素楼体轮廓上。 */
+const SDV_TUNE={dx:0,dy:0,fix:{}};
+const CAMPUS_OBST_SDV=CAMPUS_OBST_EXP.map((r,i)=>{
+ const f=SDV_TUNE.fix[i]||[0,0,0,0];
+ return [r[0]+SDV_TUNE.dx+f[0],r[1]+SDV_TUNE.dy+f[1],
+         r[2]+SDV_TUNE.dx+f[2],r[3]+SDV_TUNE.dy+f[3],r[4]];
+});
+const SOLIDS_SDV=CAMPUS_OBST_SDV.map((r,i)=>({x1:r[0],y1:r[1],x2:r[2],y2:r[3],t:r[4],b:null,n:DORM_NAMES[i]||null}));
 
 /* 碰撞体：B 区（像素版）= 建筑实体 + 围墙；A 区（卫星版）= 红框障碍。
    进区时把 SOLIDS 指向对应一组，碰撞判定统一走 blocked()。 */
@@ -975,16 +986,21 @@ function terrainOf(zone){
   miniBase=null;planBase=null;      // 缩略图/全景图缓存作废
   return c;
 }
-/* 星露谷风：整张像素重绘版底图铺满世界；碰撞与 A 区（卫星版）完全一致，不画红框 */
+/* 星露谷风：整张像素重绘版底图铺满世界，并在上面叠一层与 A 区同款的
+   碰撞体描边（白色轮廓 = 实际可阻挡范围），这样看到的就是判定范围。 */
 function buildTerrainSdv(){
-  tg.fillStyle='#40503a'; tg.fillRect(0,0,WW,WH);
+  const g=tg;                          // 图片异步加载，回调里必须用自己这块画布的上下文
+  const w=WW,h=WH;                     // 尺寸也要锁住：回调时全局 WW/WH 可能已切到别的分区
+  g.fillStyle='#40503a'; g.fillRect(0,0,w,h);
   const im=new Image();
   im.decoding='async';
   im.onload=()=>{
-    tg.imageSmoothingEnabled=false;      // 像素画放大用最近邻，避免二次模糊
-    tg.drawImage(im,0,0,WW,WH);
+    g.imageSmoothingEnabled=false;      // 像素画放大用最近邻，避免二次模糊
+    g.drawImage(im,0,0,w,h);
+    drawSdvObst(g);                     // 碰撞体可见化
     miniBase=null;planBase=null;
   };
+  im.onerror=()=>{drawSdvObst(g);miniBase=null;planBase=null;};
   im.src='/map/stardew.webp';
 }
 /* 进区时切换世界尺寸 / 碰撞体 / 底图：
@@ -992,7 +1008,7 @@ function buildTerrainSdv(){
    星露谷风与 A 区同尺寸、同碰撞 */
 function applyZoneWorld(){
  WW=ZW[me.zone]||2304;WH=ZH[me.zone]||1216;
- SOLIDS=me.zone==='gen'?SOLIDS_GEN:SOLIDS_EXP;
+ SOLIDS=me.zone==='gen'?SOLIDS_GEN:(me.zone==='stardew'?SOLIDS_SDV:SOLIDS_EXP);
  if(me.zone!=='lobby')terrainOf(me.zone);
 }
 
@@ -1249,16 +1265,18 @@ function drawCourtArea(b) {
 /* ---------- A 区底图：高清卫星照片（保持原比例 1202:990 → 2304×1898） ----------
    照片已按世界坐标切好 12 块瓦片，这里只负责贴图 + 叠加美观的体积障碍提示。 */
 function buildTerrainExp(){
-  tg.fillStyle='#3f4a38'; tg.fillRect(0,0,WW,WH);
+  const g=tg;                  // 瓦片异步回调里 tg 可能已指向别的地形，这里锁住自己的上下文
+  g.fillStyle='#3f4a38'; g.fillRect(0,0,WW,WH);
   const tw=WW/4, th=WH/3;
+  let drawn=0;
   for(let r=0;r<3;r++)for(let c=0;c<4;c++){
     const x0=Math.max(0,c*tw-2), y0=Math.max(0,r*th-2);
     const x1=Math.min(WW,(c+1)*tw+2), y1=Math.min(WH,(r+1)*th+2);
     const im=new Image();
     im.decoding='async';
     im.onload=()=>{
-      tg.drawImage(im,x0,y0,x1-x0,y1-y0);
-      drawExpObst();
+      g.drawImage(im,x0,y0,x1-x0,y1-y0);
+      if(++drawn>=12)drawExpObst(g);      // 12 块贴完再叠一次轮廓，避免重复描边变粗变亮
       miniBase=null; planBase=null;      // 缩略图缓存作废，下次重画
     };
     im.src='/map/t'+r+'_'+c+'.jpg';
@@ -1313,31 +1331,42 @@ function unionLoops(rects){
   }
   return loops;
 }
-let _expUnion=null;
-function drawExpObst(){
-  if(!_expUnion){
-    const toR=r=>({x1:r[0],y1:r[1],x2:r[2],y2:r[3]});
-    _expUnion={
-      solid:unionLoops(CAMPUS_OBST_EXP.filter(r=>r[4]!=='wall').map(toR)),
-      wall:unionLoops(CAMPUS_OBST_EXP.filter(r=>r[4]==='wall').map(toR))
-    };
-  }
-  tg.save();
+const _unionCache=new Map();
+function unionOfRects(list,key){
+  let u=_unionCache.get(key);
+  if(u)return u;
+  const toR=r=>({x1:r[0],y1:r[1],x2:r[2],y2:r[3]});
+  u={
+    solid:unionLoops(list.filter(r=>r[4]!=='wall').map(toR)),
+    wall:unionLoops(list.filter(r=>r[4]==='wall').map(toR))
+  };
+  _unionCache.set(key,u);
+  return u;
+}
+/* bright：像素底色更饱和，描边略加强一点才看得清 */
+function paintUnion(g,u,bright){
+  if(!g)return;
+  g.save();
   const paint=(loops,wall)=>{
     if(!loops.length)return;
     const p=new Path2D();
     for(const L of loops){p.moveTo(L[0][0],L[0][1]);for(let i=1;i<L.length;i++)p.lineTo(L[i][0],L[i][1]);p.closePath();}
-    tg.save();tg.translate(2,3);                      // 轻落影
-    tg.fillStyle=wall?'rgba(38,30,20,.18)':'rgba(28,22,16,.16)';tg.fill(p,'evenodd');tg.restore();
-    tg.fillStyle=wall?'rgba(236,229,214,.30)':'rgba(255,255,255,.10)';tg.fill(p,'evenodd');
-    tg.lineJoin='round';tg.lineWidth=wall?1.6:2;
-    tg.strokeStyle=wall?'rgba(255,246,224,.6)':'rgba(255,252,242,.55)';
-    tg.stroke(p);
+    g.save();g.translate(2,3);                      // 轻落影
+    g.fillStyle=wall?'rgba(38,30,20,.18)':'rgba(28,22,16,.16)';g.fill(p,'evenodd');g.restore();
+    g.fillStyle=wall?(bright?'rgba(236,229,214,.22)':'rgba(236,229,214,.30)')
+                     :(bright?'rgba(255,255,255,.07)':'rgba(255,255,255,.10)');
+    g.fill(p,'evenodd');
+    g.lineJoin='round';g.lineWidth=wall?1.6:2;
+    g.strokeStyle=wall?(bright?'rgba(255,246,224,.72)':'rgba(255,246,224,.6)')
+                       :(bright?'rgba(255,252,242,.72)':'rgba(255,252,242,.55)');
+    g.stroke(p);
   };
-  paint(_expUnion.solid,false);
-  paint(_expUnion.wall,true);
-  tg.restore();
+  paint(u.solid,false);
+  paint(u.wall,true);
+  g.restore();
 }
+function drawExpObst(g){ paintUnion(g||tg,unionOfRects(CAMPUS_OBST_EXP,'exp'),false); }
+function drawSdvObst(g){ paintUnion(g||tg,unionOfRects(CAMPUS_OBST_SDV,'sdv'),true); }
 /* ---------- B 区底图：像素风校园（沿用原版，不改） ---------- */
 function buildTerrainPix() {
   drawGrass(0, 0, WW, WH);
